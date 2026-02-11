@@ -4,4 +4,5 @@ idf_component_register(
          "ns_protocol.c"
     INCLUDE_DIRS "."
     REQUIRES esp_driver_rmt
+    PRIV_REQUIRES esp_timer
 )
