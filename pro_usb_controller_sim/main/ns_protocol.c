@@ -5,6 +5,7 @@
 #include "driver/gpio.h"
 #include "esp_log.h"
 #include "esp_mac.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "ns_proto.h"
 #include "tinyusb.h"
@@ -15,6 +16,16 @@ static ns_state_t s_state;
 static uint8_t s_last_subcmd_reply[64];
 static size_t s_last_subcmd_reply_len;
 static bool s_input_inited;
+static bool s_auto_key_inited;
+static bool s_auto_key_started;
+static bool s_auto_key_trigger_prev;
+static int64_t s_auto_key_last_switch_us;
+static uint8_t s_auto_key_index;
+static bool s_manual_button_override;
+static ns_button_id_t s_manual_button;
+static uint16_t s_imu_phase;
+static bool s_imu_log_pending;
+static bool s_auto_imu_enabled;
 static bool s_gpio_a_last;
 static bool s_effective_a_last;
 static bool s_a_log_inited;
@@ -40,6 +51,173 @@ static const uint8_t s_spi_rom_80[] = {
 
 /* Most ESP32-S3 dev boards expose BOOT on GPIO0 (active low). */
 #define NS_BOOT_BUTTON_GPIO GPIO_NUM_0
+#define NS_AUTO_KEY_INTERVAL_US (2000000LL)
+#define NS_STICK_MIN 0x0000
+#define NS_STICK_MAX 0x0FFF
+#define NS_STD_IMU_OFFSET 12
+#define NS_STD_IMU_SAMPLE_BYTES 12
+#define NS_STD_IMU_SAMPLE_COUNT 3
+
+typedef struct ns_auto_key_pattern_s {
+    const char *name;
+    uint8_t std_btn_right;
+    uint8_t std_btn_shared;
+    uint8_t std_btn_left;
+    uint16_t std_lx;
+    uint16_t std_ly;
+    uint16_t std_rx;
+    uint16_t std_ry;
+    uint8_t simple_btn_low;
+    uint8_t simple_btn_high;
+    uint8_t simple_hat;
+} ns_auto_key_pattern_t;
+
+static ns_auto_key_pattern_t s_auto_key_pattern_current;
+
+typedef struct {
+    const char *name;
+    ns_button_id_t button;
+    uint16_t std_lx;
+    uint16_t std_ly;
+    uint16_t std_rx;
+    uint16_t std_ry;
+    bool enable_imu_test;
+} ns_auto_test_item_t;
+
+#define NS_TEST_ITEM_BTN(_name, _button) \
+    { _name, _button, NS_STICK_CENTER, NS_STICK_CENTER, NS_STICK_CENTER, NS_STICK_CENTER, false }
+
+static const ns_auto_test_item_t s_auto_test_items[] = {
+    NS_TEST_ITEM_BTN("b0:Y", NS_BUTTON_Y),
+    NS_TEST_ITEM_BTN("b1:X", NS_BUTTON_X),
+    NS_TEST_ITEM_BTN("b2:B", NS_BUTTON_B),
+    NS_TEST_ITEM_BTN("b3:A", NS_BUTTON_A),
+    NS_TEST_ITEM_BTN("b4:L", NS_BUTTON_L),
+    NS_TEST_ITEM_BTN("b5:R", NS_BUTTON_R),
+    NS_TEST_ITEM_BTN("b6:ZL", NS_BUTTON_ZL),
+    NS_TEST_ITEM_BTN("b7:ZR", NS_BUTTON_ZR),
+    NS_TEST_ITEM_BTN("b8:MINUS", NS_BUTTON_MINUS),
+    NS_TEST_ITEM_BTN("b9:PLUS", NS_BUTTON_PLUS),
+    NS_TEST_ITEM_BTN("b10:L_STICK", NS_BUTTON_L_STICK),
+    NS_TEST_ITEM_BTN("b11:R_STICK", NS_BUTTON_R_STICK),
+    NS_TEST_ITEM_BTN("b12:HOME", NS_BUTTON_HOME),
+    NS_TEST_ITEM_BTN("b13:CAPTURE", NS_BUTTON_CAPTURE),
+    NS_TEST_ITEM_BTN("b14:UP", NS_BUTTON_UP),
+    NS_TEST_ITEM_BTN("b15:DOWN", NS_BUTTON_DOWN),
+    NS_TEST_ITEM_BTN("b16:LEFT", NS_BUTTON_LEFT),
+    NS_TEST_ITEM_BTN("b17:RIGHT", NS_BUTTON_RIGHT),
+    {"L_X_MIN", NS_BUTTON_NONE, NS_STICK_MIN,    NS_STICK_CENTER, NS_STICK_CENTER, NS_STICK_CENTER, false},
+    {"L_X_MAX", NS_BUTTON_NONE, NS_STICK_MAX,    NS_STICK_CENTER, NS_STICK_CENTER, NS_STICK_CENTER, false},
+    {"L_Y_MIN", NS_BUTTON_NONE, NS_STICK_CENTER, NS_STICK_MIN,    NS_STICK_CENTER, NS_STICK_CENTER, false},
+    {"L_Y_MAX", NS_BUTTON_NONE, NS_STICK_CENTER, NS_STICK_MAX,    NS_STICK_CENTER, NS_STICK_CENTER, false},
+    {"R_X_MIN", NS_BUTTON_NONE, NS_STICK_CENTER, NS_STICK_CENTER, NS_STICK_MIN,    NS_STICK_CENTER, false},
+    {"R_X_MAX", NS_BUTTON_NONE, NS_STICK_CENTER, NS_STICK_CENTER, NS_STICK_MAX,    NS_STICK_CENTER, false},
+    {"R_Y_MIN", NS_BUTTON_NONE, NS_STICK_CENTER, NS_STICK_CENTER, NS_STICK_CENTER, NS_STICK_MIN,    false},
+    {"R_Y_MAX", NS_BUTTON_NONE, NS_STICK_CENTER, NS_STICK_CENTER, NS_STICK_CENTER, NS_STICK_MAX,    false},
+    {"TEST_ENABLE_IMU", NS_BUTTON_NONE, NS_STICK_CENTER, NS_STICK_CENTER, NS_STICK_CENTER, NS_STICK_CENTER, true},
+};
+
+static void ns_pattern_reset(ns_auto_key_pattern_t *pattern)
+{
+    memset(pattern, 0, sizeof(*pattern));
+    pattern->std_lx = NS_STICK_CENTER;
+    pattern->std_ly = NS_STICK_CENTER;
+    pattern->std_rx = NS_STICK_CENTER;
+    pattern->std_ry = NS_STICK_CENTER;
+    pattern->simple_hat = 0x08;
+}
+
+static void ns_pattern_apply_button(ns_auto_key_pattern_t *pattern, ns_button_id_t button)
+{
+    switch (button) {
+    case NS_BUTTON_Y:
+        pattern->std_btn_right = 0x01;
+        pattern->simple_btn_high = 0x01;
+        break;
+    case NS_BUTTON_X:
+        pattern->std_btn_right = 0x02;
+        pattern->simple_btn_high = 0x02;
+        break;
+    case NS_BUTTON_B:
+        pattern->std_btn_right = 0x04;
+        pattern->simple_btn_high = 0x04;
+        break;
+    case NS_BUTTON_A:
+        pattern->std_btn_right = 0x08;
+        pattern->simple_btn_high = 0x08;
+        break;
+    case NS_BUTTON_L:
+        pattern->std_btn_left = 0x40;
+        pattern->simple_btn_low = 0x40;
+        break;
+    case NS_BUTTON_R:
+        pattern->std_btn_right = 0x40;
+        pattern->simple_btn_high = 0x40;
+        break;
+    case NS_BUTTON_ZL:
+        pattern->std_btn_left = 0x80;
+        pattern->simple_btn_low = 0x80;
+        break;
+    case NS_BUTTON_ZR:
+        pattern->std_btn_right = 0x80;
+        pattern->simple_btn_high = 0x80;
+        break;
+    case NS_BUTTON_MINUS:
+        pattern->std_btn_shared = 0x01;
+        pattern->simple_btn_low = 0x01;
+        break;
+    case NS_BUTTON_PLUS:
+        pattern->std_btn_shared = 0x02;
+        pattern->simple_btn_low = 0x02;
+        break;
+    case NS_BUTTON_L_STICK:
+        pattern->std_btn_shared = 0x08;
+        pattern->simple_btn_low = 0x20;
+        break;
+    case NS_BUTTON_R_STICK:
+        pattern->std_btn_shared = 0x04;
+        pattern->simple_btn_high = 0x20;
+        break;
+    case NS_BUTTON_HOME:
+        pattern->std_btn_shared = 0x10;
+        pattern->simple_btn_low = 0x10;
+        break;
+    case NS_BUTTON_CAPTURE:
+        pattern->std_btn_shared = 0x20;
+        pattern->simple_btn_high = 0x10;
+        break;
+    case NS_BUTTON_UP:
+        pattern->std_btn_left = 0x02;
+        pattern->simple_hat = 0x00;
+        break;
+    case NS_BUTTON_DOWN:
+        pattern->std_btn_left = 0x01;
+        pattern->simple_hat = 0x04;
+        break;
+    case NS_BUTTON_LEFT:
+        pattern->std_btn_left = 0x08;
+        pattern->simple_hat = 0x06;
+        break;
+    case NS_BUTTON_RIGHT:
+        pattern->std_btn_left = 0x04;
+        pattern->simple_hat = 0x02;
+        break;
+    case NS_BUTTON_NONE:
+    default:
+        break;
+    }
+}
+
+static void ns_build_pattern_from_test_item(const ns_auto_test_item_t *item, ns_auto_key_pattern_t *pattern)
+{
+    ns_pattern_reset(pattern);
+    pattern->name = item->name;
+    pattern->std_lx = item->std_lx;
+    pattern->std_ly = item->std_ly;
+    pattern->std_rx = item->std_rx;
+    pattern->std_ry = item->std_ry;
+    ns_pattern_apply_button(pattern, item->button);
+}
 
 static void ns_input_init(void)
 {
@@ -82,6 +260,51 @@ static bool ns_button_a_pressed(void)
     return effective_pressed;
 }
 
+static const ns_auto_key_pattern_t *ns_get_auto_key_pattern(void)
+{
+    static const ns_auto_test_item_t s_manual_item = {
+        "MANUAL_BUTTON", NS_BUTTON_NONE, NS_STICK_CENTER, NS_STICK_CENTER, NS_STICK_CENTER, NS_STICK_CENTER, false
+    };
+    const ns_auto_test_item_t *item = NULL;
+    bool trigger_pressed = ns_button_a_pressed();
+    int64_t now = esp_timer_get_time();
+
+    if (s_manual_button_override) {
+        ns_auto_test_item_t manual_item = s_manual_item;
+        manual_item.button = s_manual_button;
+        s_auto_imu_enabled = false;
+        ns_build_pattern_from_test_item(&manual_item, &s_auto_key_pattern_current);
+        return &s_auto_key_pattern_current;
+    }
+
+    if (trigger_pressed && !s_auto_key_trigger_prev) {
+        s_auto_key_index = 0;
+        s_auto_key_last_switch_us = now;
+        s_auto_key_started = true;
+        s_auto_key_inited = true;
+        s_imu_log_pending = true;
+        ESP_LOGI(TAG, "auto key test start: %s", s_auto_test_items[s_auto_key_index].name);
+    }
+    s_auto_key_trigger_prev = trigger_pressed;
+
+    if (!s_auto_key_started || !s_auto_key_inited) {
+        return NULL;
+    }
+
+    while ((now - s_auto_key_last_switch_us) >= NS_AUTO_KEY_INTERVAL_US) {
+        s_auto_key_last_switch_us += NS_AUTO_KEY_INTERVAL_US;
+        s_auto_key_index = (uint8_t)((s_auto_key_index + 1U) %
+                                     (sizeof(s_auto_test_items) / sizeof(s_auto_test_items[0])));
+        s_imu_log_pending = true;
+        ESP_LOGI(TAG, "auto key test switch -> %s", s_auto_test_items[s_auto_key_index].name);
+    }
+
+    item = &s_auto_test_items[s_auto_key_index];
+    s_auto_imu_enabled = item->enable_imu_test;
+    ns_build_pattern_from_test_item(item, &s_auto_key_pattern_current);
+    return &s_auto_key_pattern_current;
+}
+
 static bool ns_hid_ready(void)
 {
     return tud_mounted() && tud_hid_ready();
@@ -94,6 +317,84 @@ static void ns_pack_stick(uint8_t out3[3], uint16_t x, uint16_t y)
     out3[2] = (y >> 4) & 0xFF;
 }
 
+static uint16_t ns_stick_12_to_16(uint16_t axis12)
+{
+    return (uint16_t)(axis12 << 4);
+}
+
+static int16_t ns_triangle_wave(uint16_t phase, int16_t amplitude)
+{
+    uint16_t t = (uint16_t)(phase & 0x07FFU);
+    int32_t value;
+
+    if (t < 1024U) {
+        value = (int32_t)t;
+    } else {
+        value = 2047 - (int32_t)t;
+    }
+
+    return (int16_t)(((value * 2 - 1023) * amplitude) / 1023);
+}
+
+static void ns_pack_i16le(uint8_t *dst, int16_t value)
+{
+    dst[0] = (uint8_t)(value & 0xFF);
+    dst[1] = (uint8_t)(((uint16_t)value >> 8) & 0xFF);
+}
+
+static void ns_fill_imu_payload(uint8_t *payload, size_t len)
+{
+    size_t imu_total_len = NS_STD_IMU_OFFSET + NS_STD_IMU_SAMPLE_BYTES * NS_STD_IMU_SAMPLE_COUNT;
+    if (!(s_state.imu_enabled || s_auto_imu_enabled) || len < imu_total_len) {
+        return;
+    }
+
+    int16_t log_accel_x = 0;
+    int16_t log_accel_y = 0;
+    int16_t log_accel_z = 0;
+    int16_t log_gyro_pitch = 0;
+    int16_t log_gyro_roll = 0;
+    int16_t log_gyro_yaw = 0;
+
+    for (uint8_t sample = 0; sample < NS_STD_IMU_SAMPLE_COUNT; sample++) {
+        uint8_t *imu = &payload[NS_STD_IMU_OFFSET + sample * NS_STD_IMU_SAMPLE_BYTES];
+        uint16_t phase = (uint16_t)(s_imu_phase + (uint16_t)sample * 171U);
+
+        int16_t accel_x = ns_triangle_wave(phase, 800);
+        int16_t accel_y = ns_triangle_wave((uint16_t)(phase + 683U), 650);
+        int16_t accel_z = (int16_t)(4096 + ns_triangle_wave((uint16_t)(phase + 341U), 220));
+
+        int16_t gyro_pitch = ns_triangle_wave((uint16_t)(phase + 128U), 1200);
+        int16_t gyro_roll = ns_triangle_wave((uint16_t)(phase + 512U), 900);
+        int16_t gyro_yaw = ns_triangle_wave((uint16_t)(phase + 896U), 1050);
+
+        ns_pack_i16le(&imu[0], accel_x);
+        ns_pack_i16le(&imu[2], accel_y);
+        ns_pack_i16le(&imu[4], accel_z);
+        ns_pack_i16le(&imu[6], gyro_pitch);
+        ns_pack_i16le(&imu[8], gyro_roll);
+        ns_pack_i16le(&imu[10], gyro_yaw);
+
+        if (sample == 0) {
+            log_accel_x = accel_x;
+            log_accel_y = accel_y;
+            log_accel_z = accel_z;
+            log_gyro_pitch = gyro_pitch;
+            log_gyro_roll = gyro_roll;
+            log_gyro_yaw = gyro_yaw;
+        }
+    }
+
+    if (s_imu_log_pending) {
+        ESP_LOGI(TAG, "imu test ax=%d ay=%d az=%d gx=%d gy=%d gz=%d",
+                 log_accel_x, log_accel_y, log_accel_z,
+                 log_gyro_pitch, log_gyro_roll, log_gyro_yaw);
+        s_imu_log_pending = false;
+    }
+
+    s_imu_phase = (uint16_t)(s_imu_phase + 85U);
+}
+
 static void ns_send_report(uint8_t report_id, const uint8_t *payload, size_t len)
 {
     if (!ns_hid_ready()) {
@@ -104,6 +405,8 @@ static void ns_send_report(uint8_t report_id, const uint8_t *payload, size_t len
 
 static void ns_fill_base_payload(uint8_t *payload, size_t len)
 {
+    const ns_auto_key_pattern_t *pattern = ns_get_auto_key_pattern();
+
     if (len < 12) {
         return;
     }
@@ -112,13 +415,15 @@ static void ns_fill_base_payload(uint8_t *payload, size_t len)
     /* Match known-working nscon behavior for USB status byte. */
     payload[1] = 0x81;
 
-    /* Byte3: right-side buttons. A is bit 0x08. */
-    payload[2] = ns_button_a_pressed() ? 0x08 : 0x00;
-    payload[3] = 0x00;
-    payload[4] = 0x00;
+    /* Byte3: right-side buttons. */
+    payload[2] = pattern ? pattern->std_btn_right : 0x00;
+    payload[3] = pattern ? pattern->std_btn_shared : 0x00;
+    payload[4] = pattern ? pattern->std_btn_left : 0x00;
 
-    ns_pack_stick(&payload[5], NS_STICK_CENTER, NS_STICK_CENTER);
-    ns_pack_stick(&payload[8], NS_STICK_CENTER, NS_STICK_CENTER);
+    ns_pack_stick(&payload[5], pattern ? pattern->std_lx : NS_STICK_CENTER,
+                  pattern ? pattern->std_ly : NS_STICK_CENTER);
+    ns_pack_stick(&payload[8], pattern ? pattern->std_rx : NS_STICK_CENTER,
+                  pattern ? pattern->std_ry : NS_STICK_CENTER);
     payload[11] = 0x00;
 }
 
@@ -180,26 +485,31 @@ static void ns_send_std_report(void)
 {
     uint8_t payload[NS_STD_PAYLOAD_LEN] = {0};
     ns_fill_base_payload(payload, sizeof(payload));
+    ns_fill_imu_payload(payload, sizeof(payload));
     ns_send_report(NS_REPORT_ID_STD, payload, sizeof(payload));
 }
 
 static void ns_send_simple_hid_report(void)
 {
     uint8_t payload[11] = {0};
-    uint8_t a_pressed = ns_button_a_pressed() ? 0x08 : 0x00;
+    const ns_auto_key_pattern_t *pattern = ns_get_auto_key_pattern();
+    uint16_t lx16 = ns_stick_12_to_16(pattern ? pattern->std_lx : NS_STICK_CENTER);
+    uint16_t ly16 = ns_stick_12_to_16(pattern ? pattern->std_ly : NS_STICK_CENTER);
+    uint16_t rx16 = ns_stick_12_to_16(pattern ? pattern->std_rx : NS_STICK_CENTER);
+    uint16_t ry16 = ns_stick_12_to_16(pattern ? pattern->std_ry : NS_STICK_CENTER);
 
     /* 0x3F format: 2 bytes buttons + hat + 8 bytes stick/filler. */
-    payload[0] = 0x00;
-    payload[1] = a_pressed;
-    payload[2] = 0x08; /* neutral hat */
-    payload[3] = 0x40;
-    payload[4] = 0x8A;
-    payload[5] = 0x4F;
-    payload[6] = 0x8A;
-    payload[7] = 0xD0;
-    payload[8] = 0x7E;
-    payload[9] = 0xDF;
-    payload[10] = 0x7F;
+    payload[0] = pattern ? pattern->simple_btn_low : 0x00;
+    payload[1] = pattern ? pattern->simple_btn_high : 0x00;
+    payload[2] = pattern ? pattern->simple_hat : 0x08;
+    payload[3] = (uint8_t)(lx16 & 0xFF);
+    payload[4] = (uint8_t)((lx16 >> 8) & 0xFF);
+    payload[5] = (uint8_t)(ly16 & 0xFF);
+    payload[6] = (uint8_t)((ly16 >> 8) & 0xFF);
+    payload[7] = (uint8_t)(rx16 & 0xFF);
+    payload[8] = (uint8_t)((rx16 >> 8) & 0xFF);
+    payload[9] = (uint8_t)(ry16 & 0xFF);
+    payload[10] = (uint8_t)((ry16 >> 8) & 0xFF);
     ns_send_report(0x3F, payload, sizeof(payload));
 }
 
@@ -301,6 +611,9 @@ static void ns_handle_subcmd(const uint8_t *data, size_t len)
     case NS_SUBCMD_ENABLE_IMU:
         if (subcmd_len >= 1) {
             s_state.imu_enabled = (subcmd_data[0] != 0);
+            if (s_state.imu_enabled) {
+                s_imu_log_pending = true;
+            }
         }
         ns_send_subcmd_reply(0x80, subcmd_id, NULL, 0);
         break;
@@ -374,6 +687,16 @@ void ns_protocol_init(void)
     s_state.imu_enabled = false;
     s_state.vibration_enabled = false;
     s_state.player_lights = 0;
+    s_auto_key_inited = false;
+    s_auto_key_started = false;
+    s_auto_key_trigger_prev = false;
+    s_auto_key_last_switch_us = 0;
+    s_auto_key_index = 0;
+    s_manual_button_override = false;
+    s_manual_button = NS_BUTTON_NONE;
+    s_imu_phase = 0;
+    s_imu_log_pending = false;
+    s_auto_imu_enabled = false;
     s_a_log_inited = false;
 
     memset(s_last_subcmd_reply, 0, sizeof(s_last_subcmd_reply));
@@ -394,6 +717,16 @@ void ns_protocol_periodic(void)
     } else if (s_state.report_mode == 0x3F) {
         ns_send_simple_hid_report();
     }
+}
+
+void ns_protocol_set_test_button(ns_button_id_t button)
+{
+    if (button > NS_BUTTON_RIGHT) {
+        return;
+    }
+
+    s_manual_button = button;
+    s_manual_button_override = (button != NS_BUTTON_NONE);
 }
 
 uint16_t ns_protocol_get_report(uint8_t instance,
