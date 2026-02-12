@@ -5,6 +5,7 @@
 #include "ns_descriptors.h"
 #include "ns_proto.h"
 #include "ns_protocol.h"
+#include "ns_wifi_control.h"
 #include "tinyusb.h"
 #include "tinyusb_default_config.h"
 
@@ -40,6 +41,7 @@ void app_main(void)
 
     ns_protocol_init();
     ns_descriptors_fill_tusb_config(&tusb_cfg);
+    ns_wifi_control_start();
 
     ESP_LOGI(TAG, "Nintendo Switch Pro USB simulator init");
     ESP_LOGI(TAG, "USB VID:PID = %04X:%04X", NS_VENDOR_ID, NS_PRODUCT_ID);
@@ -53,6 +55,7 @@ void app_main(void)
             ESP_LOGI(TAG, "tud_mounted changed: %d -> %d", (int)last_mounted, (int)mounted);
             last_mounted = mounted;
         }
+        ns_wifi_control_periodic();
         ns_protocol_periodic();
         vTaskDelay(pdMS_TO_TICKS(NS_STD_PERIOD_MS));
     }
