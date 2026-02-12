@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# MediaPipe downloaded model files
+pose_landmarker_full.task
+*.task
+models/*.task
+
+# Local system/editor artifacts
+.DS_Store
+.idea/
+.vscode/
