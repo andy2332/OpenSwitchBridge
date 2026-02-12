@@ -13,3 +13,12 @@ models/*.task
 .DS_Store
 .idea/
 .vscode/
+
+# Tool caches / temp files
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+*.log
+*.tmp
+*.bak

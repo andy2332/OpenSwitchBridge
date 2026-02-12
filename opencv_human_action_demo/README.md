@@ -15,8 +15,9 @@
 opencv_human_action_demo/
 ├── README.md
 ├── arm_pose_demo.py
+├── full_body_localization_demo.py
 ├── requirements.txt
-└── run.py
+└── run_arm_pose.sh
 ```
 
 ## 安装依赖
@@ -56,53 +57,42 @@ pip install -r requirements.txt
 ### 1) 摄像头实时识别
 
 ```bash
-python run.py --source 0
-```
-
-默认优先上半身识别，更适合笔记本近距离场景。
-如需强制全身模式：
-
-```bash
-python run.py --source 0 --full-body
+python full_body_localization_demo.py --source 0
 ```
 
 建议先用高分辨率 + 调试模式定位：
 
 ```bash
-python run.py --source 0 --set-res 1280x720 --debug
+python full_body_localization_demo.py --source 0 --set-res 1280x720
 ```
 
 如果框仍漂移，建议加跟踪调参：
 
 ```bash
-python run.py --source 0 --set-res 1280x720 --debug --smooth-alpha 0.25 --detect-interval 8
+python full_body_localization_demo.py --source 0 --set-res 1280x720 --display-scale 1.0
 ```
 
 ### 2) 视频文件识别
 
 ```bash
-python run.py --source demo.mp4
+python full_body_localization_demo.py --source demo.mp4
 ```
 
 ## 可调参数
 
-- `--min-area`: 最小人体框面积（默认 12000）
-- `--history`: 动作判断的历史帧数（默认 10）
 - `--display-scale`: 显示缩放比例（默认 1.0）
 - `--set-res`: 设置摄像头分辨率（如 `1280x720`）
-- `--debug`: 打开调试日志与画面调试信息（fps/检测计数/框参数）
-- `--smooth-alpha`: 检测框平滑系数（默认 `0.45`，越小越稳）
-- `--detect-interval`: 跟踪时每 N 帧重新检测一次（默认 `6`）
-- `--pose`: `auto/on/off`，是否使用 MediaPipe Pose 真实关键点（默认 `auto`）
-- `--pose-min-visibility`: Pose 关键点可见性阈值（默认 `0.35`）
+- `--min-visibility`: 关键点可见性阈值（默认 `0.35`）
+- `--backend`: `auto/solutions/tasks`（默认 `auto`）
+- `--task-model`: `tasks` 后端模型路径（默认 `pose_landmarker_full.task`；不存在会自动下载）
+- `--no-mirror`: 关闭默认左右镜像
 
 示例：
 
 ```bash
-python run.py --source 0 --min-area 9000 --history 12 --display-scale 1.2
-python run.py --source 0 --set-res 1280x720 --debug --smooth-alpha 0.35
-python run.py --source 0 --set-res 1280x720 --debug --pose on
-python run.py --source 0 --set-res 1280x720 --debug --pose on --pose-min-visibility 0.3
+python full_body_localization_demo.py --source 0 --set-res 1280x720
+python full_body_localization_demo.py --backend tasks --task-model pose_landmarker_full.task --source 0 --set-res 1280x720
+python full_body_localization_demo.py --backend solutions --source 0 --set-res 1280x720 --min-visibility 0.3
 ```
 
 ## 手臂识别专项 Demo（推荐）
