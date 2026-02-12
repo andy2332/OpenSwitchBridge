@@ -23,9 +23,15 @@ static int64_t s_auto_key_last_switch_us;
 static uint8_t s_auto_key_index;
 static bool s_manual_button_override;
 static ns_button_id_t s_manual_button;
+static ns_combo_test_mode_t s_combo_test_mode;
+static bool s_custom_input_override;
+static ns_custom_input_t s_custom_input;
 static uint16_t s_imu_phase;
 static bool s_imu_log_pending;
 static bool s_auto_imu_enabled;
+static bool s_combo_seq_active;
+static uint8_t s_combo_seq_step;
+static int64_t s_combo_seq_last_switch_us;
 static bool s_gpio_a_last;
 static bool s_effective_a_last;
 static bool s_a_log_inited;
@@ -57,6 +63,7 @@ static const uint8_t s_spi_rom_80[] = {
 #define NS_STD_IMU_OFFSET 12
 #define NS_STD_IMU_SAMPLE_BYTES 12
 #define NS_STD_IMU_SAMPLE_COUNT 3
+#define NS_COMBO_STEP_INTERVAL_US (250000LL)
 
 typedef struct ns_auto_key_pattern_s {
     const char *name;
@@ -115,6 +122,8 @@ static const ns_auto_test_item_t s_auto_test_items[] = {
     {"R_Y_MIN", NS_BUTTON_NONE, NS_STICK_CENTER, NS_STICK_CENTER, NS_STICK_CENTER, NS_STICK_MIN,    false},
     {"R_Y_MAX", NS_BUTTON_NONE, NS_STICK_CENTER, NS_STICK_CENTER, NS_STICK_CENTER, NS_STICK_MAX,    false},
     {"TEST_ENABLE_IMU", NS_BUTTON_NONE, NS_STICK_CENTER, NS_STICK_CENTER, NS_STICK_CENTER, NS_STICK_CENTER, true},
+    {"TEST_CHORD_ABXY_DPAD", NS_BUTTON_NONE, NS_STICK_CENTER, NS_STICK_CENTER, NS_STICK_CENTER, NS_STICK_CENTER, false},
+    {"TEST_COMBO_SEQ", NS_BUTTON_NONE, NS_STICK_CENTER, NS_STICK_CENTER, NS_STICK_CENTER, NS_STICK_CENTER, false},
 };
 
 static void ns_pattern_reset(ns_auto_key_pattern_t *pattern)
@@ -219,6 +228,60 @@ static void ns_build_pattern_from_test_item(const ns_auto_test_item_t *item, ns_
     ns_pattern_apply_button(pattern, item->button);
 }
 
+static void ns_build_pattern_from_custom_input(const ns_custom_input_t *input, ns_auto_key_pattern_t *pattern)
+{
+    if (input == NULL || pattern == NULL) {
+        return;
+    }
+
+    ns_pattern_reset(pattern);
+    pattern->name = "CUSTOM_INPUT";
+    pattern->std_btn_right = input->std_btn_right;
+    pattern->std_btn_shared = input->std_btn_shared;
+    pattern->std_btn_left = input->std_btn_left;
+    pattern->std_lx = input->std_lx;
+    pattern->std_ly = input->std_ly;
+    pattern->std_rx = input->std_rx;
+    pattern->std_ry = input->std_ry;
+    pattern->simple_btn_low = input->simple_btn_low;
+    pattern->simple_btn_high = input->simple_btn_high;
+    pattern->simple_hat = input->simple_hat;
+}
+
+static void ns_build_chord_pattern(ns_auto_key_pattern_t *pattern)
+{
+    ns_pattern_reset(pattern);
+    pattern->name = "TEST_CHORD_ABXY_DPAD";
+    pattern->std_btn_right = 0x0F;
+    pattern->std_btn_left = 0x02; /* UP */
+    pattern->simple_btn_high = 0x0F;
+    pattern->simple_hat = 0x00; /* UP */
+}
+
+static void ns_build_combo_seq_pattern(ns_auto_key_pattern_t *pattern, int64_t now_us)
+{
+    static const ns_button_id_t s_combo_buttons[] = {
+        NS_BUTTON_L, NS_BUTTON_R, NS_BUTTON_L, NS_BUTTON_R,
+        NS_BUTTON_B, NS_BUTTON_A, NS_BUTTON_B, NS_BUTTON_A,
+    };
+    size_t combo_len = sizeof(s_combo_buttons) / sizeof(s_combo_buttons[0]);
+
+    if (!s_combo_seq_active) {
+        s_combo_seq_active = true;
+        s_combo_seq_step = 0;
+        s_combo_seq_last_switch_us = now_us;
+    }
+
+    while ((now_us - s_combo_seq_last_switch_us) >= NS_COMBO_STEP_INTERVAL_US) {
+        s_combo_seq_last_switch_us += NS_COMBO_STEP_INTERVAL_US;
+        s_combo_seq_step = (uint8_t)((s_combo_seq_step + 1U) % combo_len);
+    }
+
+    ns_pattern_reset(pattern);
+    pattern->name = "TEST_COMBO_SEQ";
+    ns_pattern_apply_button(pattern, s_combo_buttons[s_combo_seq_step]);
+}
+
 static void ns_input_init(void)
 {
     if (s_input_inited) {
@@ -269,10 +332,31 @@ static const ns_auto_key_pattern_t *ns_get_auto_key_pattern(void)
     bool trigger_pressed = ns_button_a_pressed();
     int64_t now = esp_timer_get_time();
 
+    if (s_custom_input_override) {
+        s_auto_imu_enabled = false;
+        s_combo_seq_active = false;
+        ns_build_pattern_from_custom_input(&s_custom_input, &s_auto_key_pattern_current);
+        return &s_auto_key_pattern_current;
+    }
+
+    if (s_combo_test_mode == NS_COMBO_TEST_CHORD) {
+        s_combo_seq_active = false;
+        s_auto_imu_enabled = false;
+        ns_build_chord_pattern(&s_auto_key_pattern_current);
+        return &s_auto_key_pattern_current;
+    }
+
+    if (s_combo_test_mode == NS_COMBO_TEST_SEQUENCE) {
+        s_auto_imu_enabled = false;
+        ns_build_combo_seq_pattern(&s_auto_key_pattern_current, now);
+        return &s_auto_key_pattern_current;
+    }
+
     if (s_manual_button_override) {
         ns_auto_test_item_t manual_item = s_manual_item;
         manual_item.button = s_manual_button;
         s_auto_imu_enabled = false;
+        s_combo_seq_active = false;
         ns_build_pattern_from_test_item(&manual_item, &s_auto_key_pattern_current);
         return &s_auto_key_pattern_current;
     }
@@ -301,7 +385,15 @@ static const ns_auto_key_pattern_t *ns_get_auto_key_pattern(void)
 
     item = &s_auto_test_items[s_auto_key_index];
     s_auto_imu_enabled = item->enable_imu_test;
-    ns_build_pattern_from_test_item(item, &s_auto_key_pattern_current);
+    if (strcmp(item->name, "TEST_CHORD_ABXY_DPAD") == 0) {
+        s_combo_seq_active = false;
+        ns_build_chord_pattern(&s_auto_key_pattern_current);
+    } else if (strcmp(item->name, "TEST_COMBO_SEQ") == 0) {
+        ns_build_combo_seq_pattern(&s_auto_key_pattern_current, now);
+    } else {
+        s_combo_seq_active = false;
+        ns_build_pattern_from_test_item(item, &s_auto_key_pattern_current);
+    }
     return &s_auto_key_pattern_current;
 }
 
@@ -694,9 +786,15 @@ void ns_protocol_init(void)
     s_auto_key_index = 0;
     s_manual_button_override = false;
     s_manual_button = NS_BUTTON_NONE;
+    s_combo_test_mode = NS_COMBO_TEST_NONE;
+    s_custom_input_override = false;
+    memset(&s_custom_input, 0, sizeof(s_custom_input));
     s_imu_phase = 0;
     s_imu_log_pending = false;
     s_auto_imu_enabled = false;
+    s_combo_seq_active = false;
+    s_combo_seq_step = 0;
+    s_combo_seq_last_switch_us = 0;
     s_a_log_inited = false;
 
     memset(s_last_subcmd_reply, 0, sizeof(s_last_subcmd_reply));
@@ -725,8 +823,41 @@ void ns_protocol_set_test_button(ns_button_id_t button)
         return;
     }
 
+    s_combo_test_mode = NS_COMBO_TEST_NONE;
+    s_custom_input_override = false;
     s_manual_button = button;
     s_manual_button_override = (button != NS_BUTTON_NONE);
+}
+
+void ns_protocol_set_combo_test_mode(ns_combo_test_mode_t mode)
+{
+    if (mode > NS_COMBO_TEST_SEQUENCE) {
+        return;
+    }
+
+    s_manual_button_override = false;
+    s_manual_button = NS_BUTTON_NONE;
+    s_custom_input_override = false;
+    s_combo_test_mode = mode;
+    if (mode != NS_COMBO_TEST_SEQUENCE) {
+        s_combo_seq_active = false;
+    }
+}
+
+void ns_protocol_set_custom_input(const ns_custom_input_t *input, bool enable)
+{
+    if (!enable || input == NULL) {
+        s_custom_input_override = false;
+        return;
+    }
+
+    s_manual_button_override = false;
+    s_manual_button = NS_BUTTON_NONE;
+    s_combo_test_mode = NS_COMBO_TEST_NONE;
+    s_combo_seq_active = false;
+
+    s_custom_input = *input;
+    s_custom_input_override = true;
 }
 
 uint16_t ns_protocol_get_report(uint8_t instance,

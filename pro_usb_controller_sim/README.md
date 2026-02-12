@@ -47,15 +47,40 @@ idf.py -p <PORT> flash monitor
 
 配网后串口日志出现 `Wi-Fi connected, IP: x.x.x.x`，即可通过该 IP 调用 HTTP 控制接口（端口 `80`）。
 
-Endpoints:
+## HTTP 接口说明
 
-- `GET /health`
-- `GET /button?name=A` (manual button override; supports `A/B/X/Y/L/R/ZL/ZR/UP/DOWN/LEFT/RIGHT/...`)
-- `GET /press?name=A` (press + auto release, default 100ms)
-- `GET /hold?name=A&ms=500` (press and hold for specified duration, then auto release)
-- `GET /release` (immediate release)
-- `GET /button?id=4` (by enum id, `0..18`)
-- `GET /auto` (exit manual override and return to GPIO0-triggered auto test flow)
+- `GET /health`：查看网络与服务状态
+- `GET /input`：通用输入接口（单键、组合键、摇杆）
+- `GET /sequence`：顺序动作接口（连招/宏）
+- `GET /release`：立即松开当前输入
+- `GET /auto`：退出 HTTP 手动控制，回到 GPIO0 自动测试流
+
+### `/input` 参数
+
+- `buttons`：按键列表，支持 `+`/`,` 连接，例如 `A+B+X+Y`、`L_STICK`、`UP`
+- `ms`：按住时长（毫秒），`0` 表示持续按下直到 `release`
+- `lx/ly/rx/ry`：摇杆 12-bit 值（`0..4095`）
+- `hat`：方向帽值（`0..8`，`8` 为中立）
+
+### `/sequence` 参数
+
+- `steps`：步骤串，格式 `按钮列表:时长>按钮列表:时长>...`
+- `gap`：步骤间隔（毫秒）
+- `repeat`：`0/1`，是否循环执行
+
+### Combo 调用示例
+
+```bash
+# Combo 示例1：和弦（同时按下）
+curl "http://<ESP_IP>/input?buttons=A+B+X+Y+UP&ms=800"
+
+# Combo 示例2：顺序（L->R->L->R->B->A->B->A）
+curl "http://<ESP_IP>/sequence?steps=L:120>R:120>L:120>R:120>B:120>A:120>B:120>A:120&gap=50&repeat=0"
+
+# Combo 示例3：循环方向连招（直到 release）
+curl "http://<ESP_IP>/sequence?steps=UP:100>RIGHT:100>DOWN:100>LEFT:100&gap=40&repeat=1"
+curl "http://<ESP_IP>/release"
+```
 
 Examples:
 
@@ -65,11 +90,12 @@ curl "http://192.168.4.1/provision?ssid=YOUR_WIFI&pass=YOUR_PASS"
 
 # 路由器下调用
 curl "http://<ESP_IP>/health"
-curl "http://<ESP_IP>/button?name=A"
-curl "http://<ESP_IP>/press?name=B"
-curl "http://<ESP_IP>/hold?name=HOME&ms=800"
+curl "http://<ESP_IP>/input?buttons=A&ms=100"
+curl "http://<ESP_IP>/input?buttons=A+B+X+Y+UP&ms=800"
+curl "http://<ESP_IP>/input?buttons=HOME&ms=800"
+curl "http://<ESP_IP>/input?buttons=L_STICK&lx=0&ly=4095"
+curl "http://<ESP_IP>/sequence?steps=L:120>R:120>L:120>R:120>B:120>A:120>B:120>A:120&gap=50&repeat=0"
 curl "http://<ESP_IP>/release"
-curl "http://<ESP_IP>/button?name=HOME"
 curl "http://<ESP_IP>/auto"
 ```
 

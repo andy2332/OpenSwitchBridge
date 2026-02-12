@@ -1,6 +1,7 @@
 #include "ns_wifi_control.h"
 
 #include <stdbool.h>
+#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -29,9 +30,12 @@ static const char *TAG = "NS_WIFI_CTRL";
 
 #define NS_PROVISION_TRIGGER_GPIO GPIO_NUM_35
 #define NS_PROVISION_HOLD_US (5000000LL)
-#define NS_PRESS_DEFAULT_MS 100
 #define NS_HOLD_MIN_MS 20
 #define NS_HOLD_MAX_MS 60000
+#define NS_STICK_CENTER_12BIT 0x0800
+#define NS_SEQUENCE_DEFAULT_HOLD_MS 120
+#define NS_SEQUENCE_DEFAULT_GAP_MS 50
+#define NS_SEQUENCE_MAX_STEPS 24
 
 typedef struct {
     const char *name;
@@ -76,6 +80,20 @@ static bool s_provision_btn_triggered;
 static int64_t s_provision_btn_press_start_us;
 static bool s_button_auto_release_pending;
 static int64_t s_button_auto_release_deadline_us;
+static bool s_sequence_active;
+static bool s_sequence_repeat;
+static bool s_sequence_pressing;
+static uint8_t s_sequence_step_index;
+static uint8_t s_sequence_step_count;
+static int64_t s_sequence_deadline_us;
+
+typedef struct {
+    ns_custom_input_t input;
+    uint32_t hold_ms;
+    uint32_t gap_ms;
+} ns_sequence_step_t;
+
+static ns_sequence_step_t s_sequence_steps[NS_SEQUENCE_MAX_STEPS];
 
 static const char *s_setup_html =
     "<!doctype html><html><head><meta charset=\"utf-8\">"
@@ -89,16 +107,6 @@ static const char *s_setup_html =
     "</form>"
     "<p>状态可访问: <a href=\"/health\">/health</a></p>"
     "</body></html>";
-
-static const char *ns_button_name(ns_button_id_t button)
-{
-    for (size_t i = 0; i < sizeof(s_button_name_map) / sizeof(s_button_name_map[0]); i++) {
-        if (s_button_name_map[i].button == button) {
-            return s_button_name_map[i].name;
-        }
-    }
-    return "UNKNOWN";
-}
 
 static bool ns_button_from_name(const char *name, ns_button_id_t *out_button)
 {
@@ -123,18 +131,246 @@ static void ns_http_send_json(httpd_req_t *req, const char *json)
 
 static void ns_button_release_now(void)
 {
+    ns_protocol_set_combo_test_mode(NS_COMBO_TEST_NONE);
     ns_protocol_set_test_button(NS_BUTTON_NONE);
+    ns_protocol_set_custom_input(NULL, false);
     s_button_auto_release_pending = false;
     s_button_auto_release_deadline_us = 0;
+    s_sequence_active = false;
+    s_sequence_repeat = false;
+    s_sequence_pressing = false;
+    s_sequence_step_index = 0;
+    s_sequence_step_count = 0;
+    s_sequence_deadline_us = 0;
 }
 
-static void ns_button_press_for_ms(ns_button_id_t button, uint32_t hold_ms)
+static void ns_input_reset(ns_custom_input_t *input)
 {
-    if (button < NS_BUTTON_NONE || button > NS_BUTTON_RIGHT) {
+    if (input == NULL) {
         return;
     }
 
-    ns_protocol_set_test_button(button);
+    memset(input, 0, sizeof(*input));
+    input->std_lx = NS_STICK_CENTER_12BIT;
+    input->std_ly = NS_STICK_CENTER_12BIT;
+    input->std_rx = NS_STICK_CENTER_12BIT;
+    input->std_ry = NS_STICK_CENTER_12BIT;
+    input->simple_hat = 0x08;
+}
+
+static void ns_input_apply_button(ns_custom_input_t *input, ns_button_id_t button)
+{
+    if (input == NULL) {
+        return;
+    }
+
+    switch (button) {
+    case NS_BUTTON_Y:
+        input->std_btn_right |= 0x01;
+        input->simple_btn_high |= 0x01;
+        break;
+    case NS_BUTTON_X:
+        input->std_btn_right |= 0x02;
+        input->simple_btn_high |= 0x02;
+        break;
+    case NS_BUTTON_B:
+        input->std_btn_right |= 0x04;
+        input->simple_btn_high |= 0x04;
+        break;
+    case NS_BUTTON_A:
+        input->std_btn_right |= 0x08;
+        input->simple_btn_high |= 0x08;
+        break;
+    case NS_BUTTON_L:
+        input->std_btn_left |= 0x40;
+        input->simple_btn_low |= 0x40;
+        break;
+    case NS_BUTTON_R:
+        input->std_btn_right |= 0x40;
+        input->simple_btn_high |= 0x40;
+        break;
+    case NS_BUTTON_ZL:
+        input->std_btn_left |= 0x80;
+        input->simple_btn_low |= 0x80;
+        break;
+    case NS_BUTTON_ZR:
+        input->std_btn_right |= 0x80;
+        input->simple_btn_high |= 0x80;
+        break;
+    case NS_BUTTON_MINUS:
+        input->std_btn_shared |= 0x01;
+        input->simple_btn_low |= 0x01;
+        break;
+    case NS_BUTTON_PLUS:
+        input->std_btn_shared |= 0x02;
+        input->simple_btn_low |= 0x02;
+        break;
+    case NS_BUTTON_L_STICK:
+        input->std_btn_shared |= 0x08;
+        input->simple_btn_low |= 0x20;
+        break;
+    case NS_BUTTON_R_STICK:
+        input->std_btn_shared |= 0x04;
+        input->simple_btn_high |= 0x20;
+        break;
+    case NS_BUTTON_HOME:
+        input->std_btn_shared |= 0x10;
+        input->simple_btn_low |= 0x10;
+        break;
+    case NS_BUTTON_CAPTURE:
+        input->std_btn_shared |= 0x20;
+        input->simple_btn_high |= 0x10;
+        break;
+    case NS_BUTTON_UP:
+        input->std_btn_left |= 0x02;
+        input->simple_hat = 0x00;
+        break;
+    case NS_BUTTON_DOWN:
+        input->std_btn_left |= 0x01;
+        input->simple_hat = 0x04;
+        break;
+    case NS_BUTTON_LEFT:
+        input->std_btn_left |= 0x08;
+        input->simple_hat = 0x06;
+        break;
+    case NS_BUTTON_RIGHT:
+        input->std_btn_left |= 0x04;
+        input->simple_hat = 0x02;
+        break;
+    case NS_BUTTON_NONE:
+    default:
+        break;
+    }
+}
+
+static bool ns_parse_u32(const char *value, uint32_t min_value, uint32_t max_value, uint32_t *out_value)
+{
+    char *end = NULL;
+    long parsed;
+
+    if (value == NULL || out_value == NULL) {
+        return false;
+    }
+
+    parsed = strtol(value, &end, 10);
+    if (end == value || *end != '\0') {
+        return false;
+    }
+
+    if (parsed < (long)min_value) {
+        parsed = (long)min_value;
+    } else if (parsed > (long)max_value) {
+        parsed = (long)max_value;
+    }
+    *out_value = (uint32_t)parsed;
+    return true;
+}
+
+static int ns_hex_to_val(char c)
+{
+    if (c >= '0' && c <= '9') {
+        return c - '0';
+    }
+    c = (char)tolower((unsigned char)c);
+    if (c >= 'a' && c <= 'f') {
+        return 10 + (c - 'a');
+    }
+    return -1;
+}
+
+static void ns_url_decode_inplace(char *text)
+{
+    char *src = text;
+    char *dst = text;
+
+    if (text == NULL) {
+        return;
+    }
+
+    while (*src != '\0') {
+        if (*src == '%' && src[1] != '\0' && src[2] != '\0') {
+            int hi = ns_hex_to_val(src[1]);
+            int lo = ns_hex_to_val(src[2]);
+            if (hi >= 0 && lo >= 0) {
+                *dst++ = (char)((hi << 4) | lo);
+                src += 3;
+                continue;
+            }
+        } else if (*src == '+') {
+            *dst++ = ' ';
+            src++;
+            continue;
+        }
+
+        *dst++ = *src++;
+    }
+    *dst = '\0';
+}
+
+static bool ns_parse_button_token(const char *token, ns_button_id_t *out_button)
+{
+    char *end = NULL;
+    long parsed_id;
+
+    if (token == NULL || out_button == NULL) {
+        return false;
+    }
+
+    if (ns_button_from_name(token, out_button)) {
+        return true;
+    }
+
+    parsed_id = strtol(token, &end, 10);
+    if (end != token && *end == '\0' && parsed_id >= NS_BUTTON_NONE && parsed_id <= NS_BUTTON_RIGHT) {
+        *out_button = (ns_button_id_t)parsed_id;
+        return true;
+    }
+    return false;
+}
+
+static bool ns_parse_buttons_list(char *buttons, ns_custom_input_t *input, uint8_t *out_count)
+{
+    char *token = NULL;
+    char *saveptr = NULL;
+    uint8_t button_count = 0;
+
+    if (buttons == NULL || input == NULL) {
+        return false;
+    }
+
+    token = strtok_r(buttons, ",+ ", &saveptr);
+    while (token != NULL) {
+        ns_button_id_t button = NS_BUTTON_NONE;
+        if (!ns_parse_button_token(token, &button)) {
+            return false;
+        }
+        if (button != NS_BUTTON_NONE) {
+            ns_input_apply_button(input, button);
+            button_count++;
+        }
+        token = strtok_r(NULL, ",+ ", &saveptr);
+    }
+
+    if (out_count != NULL) {
+        *out_count = button_count;
+    }
+    return true;
+}
+
+static void ns_input_apply_for_ms(const ns_custom_input_t *input, uint32_t hold_ms)
+{
+    if (input == NULL) {
+        return;
+    }
+
+    s_sequence_active = false;
+    s_sequence_repeat = false;
+    s_sequence_pressing = false;
+    s_sequence_step_index = 0;
+    s_sequence_step_count = 0;
+    s_sequence_deadline_us = 0;
+
+    ns_protocol_set_custom_input(input, true);
     if (hold_ms == 0) {
         s_button_auto_release_pending = false;
         s_button_auto_release_deadline_us = 0;
@@ -144,35 +380,224 @@ static void ns_button_press_for_ms(ns_button_id_t button, uint32_t hold_ms)
     }
 }
 
-static bool ns_parse_button_from_query(httpd_req_t *req, ns_button_id_t *out_button)
+static void ns_sequence_start(bool repeat)
 {
-    char query[128] = {0};
-    char name[32] = {0};
-    char id[16] = {0};
-    int query_len = httpd_req_get_url_query_len(req);
+    if (s_sequence_step_count == 0) {
+        return;
+    }
 
-    if (out_button == NULL || query_len <= 0 || query_len >= (int)sizeof(query)) {
+    s_button_auto_release_pending = false;
+    s_button_auto_release_deadline_us = 0;
+    s_sequence_repeat = repeat;
+    s_sequence_active = true;
+    s_sequence_pressing = true;
+    s_sequence_step_index = 0;
+    ns_protocol_set_custom_input(&s_sequence_steps[0].input, true);
+    s_sequence_deadline_us = esp_timer_get_time() + (int64_t)s_sequence_steps[0].hold_ms * 1000LL;
+}
+
+static bool ns_get_query(httpd_req_t *req, char *query, size_t query_len)
+{
+    int actual_len;
+
+    if (req == NULL || query == NULL || query_len == 0) {
         return false;
     }
 
-    if (httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK) {
+    actual_len = httpd_req_get_url_query_len(req);
+    if (actual_len <= 0 || actual_len >= (int)query_len) {
         return false;
     }
 
-    if (httpd_query_key_value(query, "name", name, sizeof(name)) == ESP_OK) {
-        return ns_button_from_name(name, out_button);
+    return httpd_req_get_url_query_str(req, query, query_len) == ESP_OK;
+}
+
+static bool ns_parse_input_query(const char *query,
+                                 ns_custom_input_t *out_input,
+                                 uint32_t *out_hold_ms,
+                                 uint8_t *out_button_count)
+{
+    char buttons[192] = {0};
+    char value_buf[32] = {0};
+    uint32_t parsed_value = 0;
+    bool has_input_param = false;
+    uint8_t button_count = 0;
+
+    if (query == NULL || out_input == NULL || out_hold_ms == NULL) {
+        return false;
     }
 
-    if (httpd_query_key_value(query, "id", id, sizeof(id)) == ESP_OK) {
-        char *end = NULL;
-        long parsed_id = strtol(id, &end, 10);
-        if (end != id && *end == '\0' && parsed_id >= NS_BUTTON_NONE && parsed_id <= NS_BUTTON_RIGHT) {
-            *out_button = (ns_button_id_t)parsed_id;
-            return true;
+    ns_input_reset(out_input);
+    *out_hold_ms = 0;
+
+    if (httpd_query_key_value(query, "buttons", buttons, sizeof(buttons)) == ESP_OK) {
+        ns_url_decode_inplace(buttons);
+        if (!ns_parse_buttons_list(buttons, out_input, &button_count)) {
+            return false;
+        }
+        has_input_param = true;
+    }
+
+    if (httpd_query_key_value(query, "lx", value_buf, sizeof(value_buf)) == ESP_OK &&
+        ns_parse_u32(value_buf, 0, 4095, &parsed_value)) {
+        out_input->std_lx = (uint16_t)parsed_value;
+        has_input_param = true;
+    }
+    if (httpd_query_key_value(query, "ly", value_buf, sizeof(value_buf)) == ESP_OK &&
+        ns_parse_u32(value_buf, 0, 4095, &parsed_value)) {
+        out_input->std_ly = (uint16_t)parsed_value;
+        has_input_param = true;
+    }
+    if (httpd_query_key_value(query, "rx", value_buf, sizeof(value_buf)) == ESP_OK &&
+        ns_parse_u32(value_buf, 0, 4095, &parsed_value)) {
+        out_input->std_rx = (uint16_t)parsed_value;
+        has_input_param = true;
+    }
+    if (httpd_query_key_value(query, "ry", value_buf, sizeof(value_buf)) == ESP_OK &&
+        ns_parse_u32(value_buf, 0, 4095, &parsed_value)) {
+        out_input->std_ry = (uint16_t)parsed_value;
+        has_input_param = true;
+    }
+    if (httpd_query_key_value(query, "hat", value_buf, sizeof(value_buf)) == ESP_OK &&
+        ns_parse_u32(value_buf, 0, 8, &parsed_value)) {
+        out_input->simple_hat = (uint8_t)parsed_value;
+        has_input_param = true;
+    }
+
+    if (httpd_query_key_value(query, "ms", value_buf, sizeof(value_buf)) == ESP_OK) {
+        ns_parse_u32(value_buf, 0, NS_HOLD_MAX_MS, out_hold_ms);
+    }
+
+    if (!has_input_param) {
+        return false;
+    }
+
+    if (out_button_count != NULL) {
+        *out_button_count = button_count;
+    }
+    return true;
+}
+
+static bool ns_parse_sequence_query(const char *query, bool *out_repeat)
+{
+    char steps[512] = {0};
+    char gap_buf[16] = {0};
+    char repeat_buf[16] = {0};
+    char *step = NULL;
+    char *saveptr = NULL;
+    uint32_t default_gap = NS_SEQUENCE_DEFAULT_GAP_MS;
+
+    if (query == NULL) {
+        return false;
+    }
+
+    if (httpd_query_key_value(query, "steps", steps, sizeof(steps)) != ESP_OK || steps[0] == '\0') {
+        return false;
+    }
+    ns_url_decode_inplace(steps);
+
+    if (httpd_query_key_value(query, "gap", gap_buf, sizeof(gap_buf)) == ESP_OK) {
+        ns_parse_u32(gap_buf, 0, NS_HOLD_MAX_MS, &default_gap);
+    }
+
+    s_sequence_step_count = 0;
+    step = strtok_r(steps, ">", &saveptr);
+    while (step != NULL) {
+        char *ms_sep = strchr(step, ':');
+        uint32_t hold_ms = NS_SEQUENCE_DEFAULT_HOLD_MS;
+        ns_custom_input_t input;
+        uint8_t button_count = 0;
+
+        if (s_sequence_step_count >= NS_SEQUENCE_MAX_STEPS) {
+            return false;
+        }
+
+        if (ms_sep != NULL) {
+            *ms_sep = '\0';
+            ms_sep++;
+            if (ms_sep[0] != '\0') {
+                ns_parse_u32(ms_sep, NS_HOLD_MIN_MS, NS_HOLD_MAX_MS, &hold_ms);
+            }
+        }
+
+        ns_input_reset(&input);
+        if (step[0] != '\0' && strcasecmp(step, "NONE") != 0) {
+            if (!ns_parse_buttons_list(step, &input, &button_count) || button_count == 0) {
+                return false;
+            }
+        }
+
+        s_sequence_steps[s_sequence_step_count].input = input;
+        s_sequence_steps[s_sequence_step_count].hold_ms = hold_ms;
+        s_sequence_steps[s_sequence_step_count].gap_ms = default_gap;
+        s_sequence_step_count++;
+
+        step = strtok_r(NULL, ">", &saveptr);
+    }
+
+    if (s_sequence_step_count == 0) {
+        return false;
+    }
+
+    if (out_repeat != NULL) {
+        *out_repeat = false;
+        if (httpd_query_key_value(query, "repeat", repeat_buf, sizeof(repeat_buf)) == ESP_OK) {
+            *out_repeat = (strcmp(repeat_buf, "1") == 0 || strcasecmp(repeat_buf, "true") == 0);
         }
     }
 
+    return true;
+}
+
+static bool ns_sequence_next_step(void)
+{
+    if (s_sequence_step_index + 1U < s_sequence_step_count) {
+        s_sequence_step_index++;
+        return true;
+    }
+    if (s_sequence_repeat) {
+        s_sequence_step_index = 0;
+        return true;
+    }
     return false;
+}
+
+static void ns_sequence_periodic(int64_t now)
+{
+    const ns_sequence_step_t *step = NULL;
+
+    if (!s_sequence_active || now < s_sequence_deadline_us) {
+        return;
+    }
+
+    step = &s_sequence_steps[s_sequence_step_index];
+    if (s_sequence_pressing) {
+        ns_protocol_set_custom_input(NULL, false);
+        s_sequence_pressing = false;
+        if (step->gap_ms == 0) {
+            if (!ns_sequence_next_step()) {
+                ns_button_release_now();
+                return;
+            }
+            step = &s_sequence_steps[s_sequence_step_index];
+            ns_protocol_set_custom_input(&step->input, true);
+            s_sequence_pressing = true;
+            s_sequence_deadline_us = now + (int64_t)step->hold_ms * 1000LL;
+        } else {
+            s_sequence_deadline_us = now + (int64_t)step->gap_ms * 1000LL;
+        }
+        return;
+    }
+
+    if (!ns_sequence_next_step()) {
+        ns_button_release_now();
+        return;
+    }
+
+    step = &s_sequence_steps[s_sequence_step_index];
+    ns_protocol_set_custom_input(&step->input, true);
+    s_sequence_pressing = true;
+    s_sequence_deadline_us = now + (int64_t)step->hold_ms * 1000LL;
 }
 
 static bool ns_wifi_save_credentials(const char *ssid, const char *pass)
@@ -352,78 +777,56 @@ static esp_err_t ns_auto_get_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
-static esp_err_t ns_button_get_handler(httpd_req_t *req)
+static esp_err_t ns_input_get_handler(httpd_req_t *req)
 {
-    ns_button_id_t button = NS_BUTTON_NONE;
+    char query[512] = {0};
+    ns_custom_input_t input;
+    uint32_t hold_ms = 0;
+    uint8_t button_count = 0;
 
-    if (!ns_parse_button_from_query(req, &button)) {
+    if (!ns_get_query(req, query, sizeof(query)) ||
+        !ns_parse_input_query(query, &input, &hold_ms, &button_count)) {
         httpd_resp_set_status(req, "400 Bad Request");
-        ns_http_send_json(req, "{\"ok\":false,\"error\":\"use name=<A|B|X|Y...> or id=<0..18>\"}");
+        ns_http_send_json(req, "{\"ok\":false,\"error\":\"use /input?buttons=A+B&ms=100&lx=2048&ly=2048\"}");
         return ESP_OK;
     }
 
-    ns_button_press_for_ms(button, 0);
+    ns_input_apply_for_ms(&input, hold_ms);
 
-    char response[96] = {0};
+    char response[192] = {0};
     snprintf(response, sizeof(response),
-             "{\"ok\":true,\"mode\":\"manual\",\"button\":\"%s\",\"id\":%d}",
-             ns_button_name(button), (int)button);
+             "{\"ok\":true,\"mode\":\"input\",\"buttons\":%u,\"ms\":%u,"
+             "\"lx\":%u,\"ly\":%u,\"rx\":%u,\"ry\":%u,\"hat\":%u}",
+             (unsigned)button_count, (unsigned)hold_ms,
+             (unsigned)input.std_lx, (unsigned)input.std_ly,
+             (unsigned)input.std_rx, (unsigned)input.std_ry,
+             (unsigned)input.simple_hat);
     ns_http_send_json(req, response);
     return ESP_OK;
 }
 
-static esp_err_t ns_press_get_handler(httpd_req_t *req)
+static esp_err_t ns_sequence_get_handler(httpd_req_t *req)
 {
-    ns_button_id_t button = NS_BUTTON_NONE;
+    char query[512] = {0};
+    bool repeat = false;
+    uint32_t gap_ms = 0;
 
-    if (!ns_parse_button_from_query(req, &button)) {
+    if (!ns_get_query(req, query, sizeof(query)) ||
+        !ns_parse_sequence_query(query, &repeat)) {
         httpd_resp_set_status(req, "400 Bad Request");
-        ns_http_send_json(req, "{\"ok\":false,\"error\":\"use name=<A|B|X|Y...> or id=<0..18>\"}");
+        ns_http_send_json(req, "{\"ok\":false,\"error\":\"use /sequence?steps=L:120>R:120>B:120>A:120&gap=50&repeat=1\"}");
         return ESP_OK;
     }
 
-    ns_button_press_for_ms(button, NS_PRESS_DEFAULT_MS);
-    char response[128] = {0};
-    snprintf(response, sizeof(response),
-             "{\"ok\":true,\"mode\":\"press\",\"button\":\"%s\",\"id\":%d,\"ms\":%d}",
-             ns_button_name(button), (int)button, NS_PRESS_DEFAULT_MS);
-    ns_http_send_json(req, response);
-    return ESP_OK;
-}
-
-static esp_err_t ns_hold_get_handler(httpd_req_t *req)
-{
-    char query[128] = {0};
-    char ms_buf[16] = {0};
-    ns_button_id_t button = NS_BUTTON_NONE;
-    uint32_t hold_ms = NS_PRESS_DEFAULT_MS;
-
-    if (!ns_parse_button_from_query(req, &button)) {
-        httpd_resp_set_status(req, "400 Bad Request");
-        ns_http_send_json(req, "{\"ok\":false,\"error\":\"use name=<A|B|X|Y...> or id=<0..18>\"}");
-        return ESP_OK;
+    ns_sequence_start(repeat);
+    if (s_sequence_step_count > 0) {
+        gap_ms = s_sequence_steps[0].gap_ms;
     }
 
-    if (httpd_req_get_url_query_len(req) > 0 &&
-        httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK &&
-        httpd_query_key_value(query, "ms", ms_buf, sizeof(ms_buf)) == ESP_OK) {
-        char *end = NULL;
-        long parsed_ms = strtol(ms_buf, &end, 10);
-        if (end != ms_buf && *end == '\0') {
-            if (parsed_ms < NS_HOLD_MIN_MS) {
-                parsed_ms = NS_HOLD_MIN_MS;
-            } else if (parsed_ms > NS_HOLD_MAX_MS) {
-                parsed_ms = NS_HOLD_MAX_MS;
-            }
-            hold_ms = (uint32_t)parsed_ms;
-        }
-    }
-
-    ns_button_press_for_ms(button, hold_ms);
-    char response[128] = {0};
+    char response[160] = {0};
     snprintf(response, sizeof(response),
-             "{\"ok\":true,\"mode\":\"hold\",\"button\":\"%s\",\"id\":%d,\"ms\":%u}",
-             ns_button_name(button), (int)button, (unsigned)hold_ms);
+             "{\"ok\":true,\"mode\":\"sequence\",\"steps\":%u,\"gap_ms\":%u,\"repeat\":%s}",
+             (unsigned)s_sequence_step_count, (unsigned)gap_ms, repeat ? "true" : "false");
     ns_http_send_json(req, response);
     return ESP_OK;
 }
@@ -507,28 +910,22 @@ static void ns_http_server_start(void)
         .handler = ns_provision_get_handler,
         .user_ctx = NULL,
     };
-    httpd_uri_t button_uri = {
-        .uri = "/button",
+    httpd_uri_t input_uri = {
+        .uri = "/input",
         .method = HTTP_GET,
-        .handler = ns_button_get_handler,
-        .user_ctx = NULL,
-    };
-    httpd_uri_t press_uri = {
-        .uri = "/press",
-        .method = HTTP_GET,
-        .handler = ns_press_get_handler,
-        .user_ctx = NULL,
-    };
-    httpd_uri_t hold_uri = {
-        .uri = "/hold",
-        .method = HTTP_GET,
-        .handler = ns_hold_get_handler,
+        .handler = ns_input_get_handler,
         .user_ctx = NULL,
     };
     httpd_uri_t release_uri = {
         .uri = "/release",
         .method = HTTP_GET,
         .handler = ns_release_get_handler,
+        .user_ctx = NULL,
+    };
+    httpd_uri_t sequence_uri = {
+        .uri = "/sequence",
+        .method = HTTP_GET,
+        .handler = ns_sequence_get_handler,
         .user_ctx = NULL,
     };
     httpd_uri_t auto_uri = {
@@ -546,10 +943,9 @@ static void ns_http_server_start(void)
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &root_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &health_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &provision_uri));
-    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &button_uri));
-    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &press_uri));
-    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &hold_uri));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &input_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &release_uri));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &sequence_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &auto_uri));
     s_http_server_started = true;
     ESP_LOGI(TAG, "HTTP control ready on port %d", config.server_port);
@@ -680,6 +1076,12 @@ void ns_wifi_control_start(void)
     s_provision_btn_press_start_us = 0;
     s_button_auto_release_pending = false;
     s_button_auto_release_deadline_us = 0;
+    s_sequence_active = false;
+    s_sequence_repeat = false;
+    s_sequence_pressing = false;
+    s_sequence_step_index = 0;
+    s_sequence_step_count = 0;
+    s_sequence_deadline_us = 0;
 
     ns_wifi_load_credentials();
     ns_provision_button_init();
@@ -695,6 +1097,7 @@ void ns_wifi_control_periodic(void)
     if (s_button_auto_release_pending && now >= s_button_auto_release_deadline_us) {
         ns_button_release_now();
     }
+    ns_sequence_periodic(now);
 
     if (level == 0) {
         if (!s_provision_btn_pressed) {
