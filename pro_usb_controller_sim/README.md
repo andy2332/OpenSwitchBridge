@@ -108,6 +108,10 @@ python3 test_http_api.py --host <ESP_IP> --port 80
 python3 test_http_api.py --host <ESP_IP> --stress --loops 500 --interval 0.1
 ```
 
+PC keyboard -> Switch mapping demo moved to:
+
+- `../examples/01_keyboard_mapping/README.md`
+
 ## Quick Switch Test
 
 1. Flash firmware to an ESP32-S3 board with USB-OTG device support.
