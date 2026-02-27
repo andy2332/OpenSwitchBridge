@@ -1,0 +1,74 @@
+version: 1
+
+template:
+  image: "assets/controller_ui.jpg"
+  size: [768, 674]
+
+transform:
+  width_torso_scale: 3.3
+  global_scale: 1.0
+  min_width: 0.42
+  anchor_y_ratio: 0.95
+  offset_x: 0.0
+
+sticks:
+  motion_radius_px: 44
+  deadzone: 0.18
+  left:
+    center: [202, 276]
+    touch_radius: 45
+    hand: left
+  right:
+    center: [475, 399]
+    touch_radius: 45
+    hand: right
+
+buttons:
+  A:
+    shape: circle
+    center: [590, 277]
+    radius: 20
+  B:
+    shape: circle
+    center: [560, 305]
+    radius: 20
+  X:
+    shape: circle
+    center: [560, 246]
+    radius: 20
+  Y:
+    shape: circle
+    center: [530, 277]
+    radius: 20
+  DPAD_UP:
+    shape: circle
+    center: [290, 368]
+    radius: 20
+  DPAD_DOWN:
+    shape: circle
+    center: [290, 430]
+    radius: 20
+  DPAD_LEFT:
+    shape: circle
+    center: [260, 399]
+    radius: 20
+  DPAD_RIGHT:
+    shape: circle
+    center: [320, 399]
+    radius: 20
+  L:
+    shape: circle
+    center: [246, 129]
+    radius: 20
+  R:
+    shape: circle
+    center: [518, 129]
+    radius: 20
+  ZL:
+    shape: circle
+    center: [246, 60]
+    radius: 20
+  ZR:
+    shape: circle
+    center: [518, 60]
+    radius: 20

@@ -1,0 +1,47 @@
+camera:
+  index: 0
+  width: 1280
+  height: 720
+
+pose:
+  min_detection_confidence: 0.5
+  min_tracking_confidence: 0.5
+  model_complexity: 1
+
+ema:
+  alpha_xy: 0.35
+
+ui:
+  show_skeleton: true
+  show_features: true
+  show_debug: true
+
+controller_touch:
+  enabled: true
+  layout_file: "../layouts/pro_controller.layout.yaml"
+  template_size: [768, 674]
+  ui_image: "../assets/controller_ui.jpg"
+  ui_alpha: 0.45
+  width_torso_scale: 3.3
+  global_scale: 1.0
+  min_width: 0.42
+  anchor_y_ratio: 0.95
+  offset_x: 0.0
+  stick_motion_radius_px: 44
+  stick_deadzone: 0.18
+  sticks:
+    left: [194, 274, 58]
+    right: [458, 399, 58]
+  buttons:
+    A: [576, 274, 30]
+    B: [546, 305, 30]
+    X: [546, 244, 30]
+    Y: [516, 274, 30]
+    DPAD_UP: [280, 368, 28]
+    DPAD_DOWN: [280, 430, 28]
+    DPAD_LEFT: [250, 399, 28]
+    DPAD_RIGHT: [310, 399, 28]
+    L: [236, 129, 34]
+    R: [501, 129, 34]
+    ZL: [236, 78, 34]
+    ZR: [501, 78, 34]
